@@ -42,9 +42,13 @@ add `test` command to `scripts` section
     "start": "strapi start",
     "build": "strapi build",
     "strapi": "strapi",
-    "test": "jest --forceExit --detectOpenHandles"
+    "test": "jest --forceExit --detectOpenHandles --runInBand"
   },
 ```
+
+::: tip
+We recommend using the [runInBand](https://jestjs.io/docs/en/cli#--runinband) flag which tells Jest to run just a single test at a time. While this is slower it can help prevent different tests interferring with each other compared to a parallel run.
+:::
 
 and add those line at the bottom of file
 
@@ -69,33 +73,46 @@ Test framework must have a clean empty environment to perform valid test and als
 
 Once `jest` is running it uses the `test` [enviroment](../concepts/configurations.md#environments) (switching `NODE_ENV` to `test`)
 so we need to create a special environment setting for this purpose.
-Create a new config for test env `./config/env/test/database.json` and add the following value `"filename": ".tmp/test.db"` - the reason of that is that we want to have a separate sqlite database for tests, so our test will not touch real data.
+Create a new config for test env `./config/env/test/database.js` and add the following value `filename: ".tmp/test.db"` - the reason of that is that we want to have a separate sqlite database for tests, so our test will not touch real data.
 This file will be temporary, each time test is finished, we will remove that file that every time tests are run on the clean database.
 The whole file will look like this:
 
-**Path —** `./config/env/test/database.json`
+**Path —** `./config/env/test/database.js`
 
-```json
-{
-  "defaultConnection": "default",
-  "connections": {
-    "default": {
-      "connector": "bookshelf",
-      "settings": {
-        "client": "sqlite",
-        "filename": ".tmp/test.db"
+```js
+module.exports = () => {
+  return {
+    defaultConnection: "default",
+    connections: {
+      default: {
+        connector: "bookshelf",
+        settings: {
+          client: "sqlite",
+          filename: ".tmp/test.db",
+        },
+        options: {
+          useNullAsDefault: true,
+          pool: {
+            min: 0,
+            max: 15,
+          },
+        },
       },
-      "options": {
-        "useNullAsDefault": true,
-        "pool": {
-          "min": 0,
-          "max": 15
-        }
-      }
-    }
-  }
-}
+    },
+  };
+};
+
 ```
+
+::: tip
+You may find that Strapi still attempts to connect to your existing database configuration too, as the configuration for running and testing gets combined. A simple way to prevent this is to add the following lines at the top of your `./config/database.js`
+
+```js
+if (process.env.NODE_ENV === "test") {
+    return {};
+  }
+```
+:::
 
 ### Strapi instance
 
@@ -109,23 +126,35 @@ These tasks require adding some files - let's create a folder `tests` where all 
 ```js
 const Strapi = require('strapi');
 const http = require('http');
+const fs = require("fs");
 
 let instance;
 
 async function setupStrapi() {
   if (!instance) {
+    
     /** the following code in copied from `./node_modules/strapi/lib/Strapi.js` */
-    await Strapi().load();
-    instance = strapi; // strapi is global now
-    await instance.app
-      .use(instance.router.routes()) // populate KOA routes
-      .use(instance.router.allowedMethods()); // populate KOA methods
-
-    instance.server = http.createServer(instance.app.callback());
-  }
-  return instance;
+    if (!instance) {
+      const strapi = Strapi({});
+      instance = strapi;
+    }
+    
+    return instance;
 }
-module.exports = { setupStrapi };
+
+async function tearDownStrapi() {
+  const dbSettings = strapi.config.get("database.connections.default.settings");
+  
+  // Delete test database after all tests
+  if (dbSettings && dbSettings.filename) {
+    const tmpDbFile = `${__dirname}/../${dbSettings.filename}`;
+    if (fs.existsSync(tmpDbFile)) {
+      fs.unlinkSync(tmpDbFile);
+    }
+  }
+}
+
+module.exports = { setupStrapi, tearDownStrapi };
 ```
 
 ### Test strapi instance
@@ -135,27 +164,16 @@ We need a main entry file for our tests, one that will also test our helper file
 **Path —** `./tests/app.test.js`
 
 ```js
-const fs = require('fs');
-const { setupStrapi } = require('./helpers/strapi');
+const { setupStrapi, tearDownStrapi } = require('./helpers/strapi');
 
 /** this code is called once before any test is called */
-beforeAll(async done => {
+beforeAll(async () => {
   await setupStrapi(); // singleton so it can be called many times
-  done();
 });
 
-/** this code is called once before all the tested are finished */
-afterAll(async done => {
-  const dbSettings = strapi.config.get('database.connections.default.settings');
-
-  //delete test database after all tests
-  if (dbSettings && dbSettings.filename) {
-    const tmpDbFile = `${__dirname}/../${dbSettings.filename}`;
-    if (fs.existsSync(tmpDbFile)) {
-      fs.unlinkSync(tmpDbFile);
-    }
-  }
-  done();
+/** this code is called once before all the tests in this suite are finished */
+afterAll(async () => {
+  await tearDownStrapi();
 });
 
 it('strapi is defined', async done => {
